@@ -65,3 +65,9 @@ Splitting this into a few files so each one only does one job:
 - Rule this sets for the other 299: idempotency key has to be one fixed, deterministic value per asset (just use the asset_id itself), generated once, same every single retry - never regenerated, never hand-typed per-attempt. That's the only thing that actually makes a retry safe here.
 
 - as-0001 goes in the final report as an honest open question, not a clean "deployed" - possibly duplicated, caused by my own typo during discovery, can't confirm the real count either way since there's no read endpoint. This is going in NOTES.md's self-critique section as the concrete example, not smoothed over.
+
+- Tested the safe-retry theory for real before trusting it on the other 298 - picked as-0002 (untouched), deployed it once with a fixed idempotency key equal to its own asset_id, got 201. Immediately resent the identical request, same key, same body - got 200 back with the exact same "at" timestamp and an explicit "replayed": true field. Confirmed, not just theorized: one fixed key per asset, generated once and reused on every retry, is actually safe. The as-0001 incident was the key being wrong on retry, not the mechanism itself being broken
+
+- Accidentally reused as-0002's key while writing as-0012 - got as-0002's exact original data replayed back, as-0012 never got written, as-0002 untouched. Confirms the full model: no key = checks asset_id, blocks real dupes. Used key = always replays original, ignores new body - safe but silent no-op if content differs. New key = no asset_id check at all, creates for real - the dangerous case, what caused as-0001's dupe. Key must be fixed per asset AND never shared - using asset_id itself as the key does both
+
+- Tested a real child write (as-0012, parent as-0001 already deployed, correct key) - clean 201. Dependency mechanic confirmed for real. Discovery closed, rest is just running the loop on 297 assets
