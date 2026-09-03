@@ -64,10 +64,30 @@ Splitting this into a few files so each one only does one job:
 
 - Rule this sets for the other 299: idempotency key has to be one fixed, deterministic value per asset (just use the asset_id itself), generated once, same every single retry - never regenerated, never hand-typed per-attempt. That's the only thing that actually makes a retry safe here.
 
-- as-0001 goes in the final report as an honest open question, not a clean "deployed" - possibly duplicated, caused by my own typo during discovery, can't confirm the real count either way since there's no read endpoint. This is going in NOTES.md's self-critique section as the concrete example, not smoothed over.
+- as-0001 goes in the final report as a plain "deployed" - that's true, it's confirmed present (two separate 201-shaped responses said so), and reporting it "blocked" would be false and would invite an operator to redeploy it, risking a real third copy. The report schema has no field for "deployed, but I suspect it's duplicated" - it isn't built to carry that, and it shouldn't be gamed into pretending it can. The duplicate-count uncertainty (possibly two copies, caused by my own mistyped key during discovery, can't confirm the real count either way since there's no read endpoint) is disclosed only in NOTES.md's self-critique section instead. That split - true-but-incomplete in the report, the full story in NOTES.md - is the operator-safe choice: it's what keeps the report itself honest (never asserts something it can't back up) without silently absorbing a mistake into a false "blocked", which would cost a redeploy the destination doesn't need.
 
 - Tested the safe-retry theory for real before trusting it on the other 298 - picked as-0002 (untouched), deployed it once with a fixed idempotency key equal to its own asset_id, got 201. Immediately resent the identical request, same key, same body - got 200 back with the exact same "at" timestamp and an explicit "replayed": true field. Confirmed, not just theorized: one fixed key per asset, generated once and reused on every retry, is actually safe. The as-0001 incident was the key being wrong on retry, not the mechanism itself being broken
 
 - Accidentally reused as-0002's key while writing as-0012 - got as-0002's exact original data replayed back, as-0012 never got written, as-0002 untouched. Confirms the full model: no key = checks asset_id, blocks real dupes. Used key = always replays original, ignores new body - safe but silent no-op if content differs. New key = no asset_id check at all, creates for real - the dangerous case, what caused as-0001's dupe. Key must be fixed per asset AND never shared - using asset_id itself as the key does both
 
 - Tested a real child write (as-0012, parent as-0001 already deployed, correct key) - clean 201. Dependency mechanic confirmed for real. Discovery closed, rest is just running the loop on 297 assets
+
+
+# Final overview before submitting
+
+## When is this entitled to say "deployed"?
+
+Only when a response proves it for *that exact asset_id*: a fresh 201, a replayed 200, or a 409 - and only if the response body itself echoes back that asset_id, not just the status code (a 2xx for a *different* asset_id, from a reused key, is not proof - proven on as-0012). No response, or one that can't be interpreted (timeout, dropped connection, unhandled 5xx), is never treated as deployed on the strength of "probably went through."
+
+## Does the code live up to that?
+
+Yes, with one disclosed exception. `report.py` only emits `"deployed"` for a journal row that reached that proof; everything else - client error, still-ambiguous at hard-stop, parent never confirmed - is `"blocked"` with a reason, even when it's probably fine.
+
+The exception is **as-0001**: two separate 201-shaped responses (one real, one under a mistyped key during manual discovery) both prove this asset_id exists, so it's reported `"deployed"` - that's true. What can't be proven, because there is no read endpoint anywhere on this API, is whether that's one copy or two. Reporting it `"blocked"` would be false and would invite a redeploy that could create a real third copy; the report schema has no field for "deployed, but maybe twice." So: deployed in the report, count uncertainty disclosed here instead. This is the one place the code's guarantee is narrower than "exactly once" - and it's narrower because of a mistake made during discovery, before the automated run existed, not a gap in the run itself.
+
+The other 297 rely on one fixed, deterministic key (`asset_id` itself) proven safe by controlled test (as-0002, as-0012), not assumed.
+
+## If I'd had more time
+
+- `mock_server.py` was planned, never built - the remaining discovery (as-0002, as-0012) happened live against real assets instead of rehearsed, mitigated by being small, controlled, single-asset tests.
+- No unit tests for `reconcile.py`'s state machine - confidence comes from those two experiments matching the model, not from exercising it directly.

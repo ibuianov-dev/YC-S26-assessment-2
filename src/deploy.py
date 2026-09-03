@@ -50,6 +50,13 @@ MANUAL_PRECHECK_RESULTS = [
         at_ms=1788469896427,
         duplicate_suspected=False,
     ),
+    dict(
+        asset_id="as-0012",
+        idempotency_key="as-0012",
+        outcome="success_fresh",
+        at_ms=None,  # not recorded during manual exploration
+        duplicate_suspected=False,  # clean single 201, correct key confirmed
+    ),
 ]
 
 
@@ -72,51 +79,84 @@ def bootstrap(conn: sqlite3.Connection, client: ApiClient) -> None:
 
 def run(conn: sqlite3.Connection, client: ApiClient) -> None:
     while True:
+        try:
+            _do_pass(conn, client)
+        except _StopRun:
+            return
+        except Exception as exc:
+            # Anything unexpected here (a transient DB error, an ApiError
+            # that got past client.py's own retries, etc.) should not kill
+            # the whole process - the journal is durable, so the safe move
+            # is to log it, back off briefly, and let the next pass retry
+            # whatever was in progress rather than silently losing however
+            # much of the clock is left because nobody was watching.
+            print(f"pass failed unexpectedly, backing off and retrying: {exc}")
+            time.sleep(5)
+
+
+class _StopRun(Exception):
+    """Internal signal that a pass decided the run is over (done, or out
+    of time) - lets _do_pass just raise instead of threading a sentinel
+    return value through run()'s try/except."""
+
+
+def _do_pass(conn: sqlite3.Connection, client: ApiClient) -> None:
+    remaining = client.run_minutes_remaining()
+    if remaining <= C.HARD_STOP_MINUTES:
+        print(f"HARD STOP: {remaining} min remaining, leaving anything unresolved as-is")
+        raise _StopRun
+
+    # Anything whose parent is definitively dead can be marked now
+    # instead of sitting in "ready" limbo for the rest of the run.
+    for asset_id in journal.blocked_on_dead_parent(conn):
+        row = journal.get_row(conn, asset_id)
+        if row is None or row.depends_on is None:
+            continue  # blocked_on_dead_parent only returns rows with a live parent id
+        parent = journal.get_row(conn, row.depends_on)
+        reason = f"parent {row.depends_on} did not deploy (status={parent.status if parent else '?'})"
+        journal.mark_parent_blocked(conn, asset_id, reason)
+
+    ready = journal.ready_to_attempt(conn)
+    if remaining <= C.STOP_NEW_WRITES_MINUTES:
+        ready = [
+            aid for aid in ready
+            if (r := journal.get_row(conn, aid)) is not None and r.attempts > 0
+        ]
+        if not ready:
+            print(f"Only new-write candidates left and {remaining} min remaining - stopping.")
+            raise _StopRun
+
+    if not ready:
+        still_open = [
+            r for r in journal.all_rows(conn)
+            if r.status in (journal.PENDING, journal.IN_FLIGHT, journal.AMBIGUOUS)
+        ]
+        if not still_open:
+            print("Nothing left to do.")
+            raise _StopRun
+        # Nothing ready right now but work remains (waiting on parents
+        # that are themselves still ambiguous) - brief pause, loop again.
+        time.sleep(2)
+        return
+
+    for asset_id in ready:
         remaining = client.run_minutes_remaining()
         if remaining <= C.HARD_STOP_MINUTES:
-            print(f"HARD STOP: {remaining} min remaining, leaving anything unresolved as-is")
-            return
-
-        # Anything whose parent is definitively dead can be marked now
-        # instead of sitting in "ready" limbo for the rest of the run.
-        for asset_id in journal.blocked_on_dead_parent(conn):
-            row = journal.get_row(conn, asset_id)
-            if row is None or row.depends_on is None:
-                continue  # blocked_on_dead_parent only returns rows with a live parent id
-            parent = journal.get_row(conn, row.depends_on)
-            reason = f"parent {row.depends_on} did not deploy (status={parent.status if parent else '?'})"
-            journal.mark_parent_blocked(conn, asset_id, reason)
-
-        ready = journal.ready_to_attempt(conn)
-        if remaining <= C.STOP_NEW_WRITES_MINUTES:
-            ready = [
-                aid for aid in ready
-                if (r := journal.get_row(conn, aid)) is not None and r.attempts > 0
-            ]
-            if not ready:
-                print(f"Only new-write candidates left and {remaining} min remaining - stopping.")
-                return
-
-        if not ready:
-            still_open = [
-                r for r in journal.all_rows(conn)
-                if r.status in (journal.PENDING, journal.IN_FLIGHT, journal.AMBIGUOUS)
-            ]
-            if not still_open:
-                print("Nothing left to do.")
-                return
-            # Nothing ready right now but work remains (waiting on parents
-            # that are themselves still ambiguous) - brief pause, loop again.
-            time.sleep(2)
-            continue
-
-        for asset_id in ready:
-            remaining = client.run_minutes_remaining()
-            if remaining <= C.HARD_STOP_MINUTES:
-                print(f"HARD STOP mid-pass: {remaining} min remaining")
-                return
+            print(f"HARD STOP mid-pass: {remaining} min remaining")
+            raise _StopRun
+        try:
             status = reconcile.attempt(conn, client, asset_id)
             print(f"{asset_id}: {status}")
+        except Exception as exc:
+            # reconcile.attempt() writes in_flight *before* the request
+            # goes out. If it dies partway through (a bug, an exception
+            # client.py didn't turn into a DeployResult), the row would
+            # otherwise be stuck at in_flight forever - ready_to_attempt()
+            # only ever picks up pending/ambiguous, so it would silently
+            # never be retried. Explicitly put it back in the retryable
+            # pool instead of trusting whatever state it was left in.
+            print(f"{asset_id}: unexpected error, marking ambiguous for retry: {exc}")
+            journal.mark_ambiguous(conn, asset_id, f"unexpected exception during attempt: {exc}")
 
 
 def main() -> None:
