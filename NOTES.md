@@ -91,3 +91,4 @@ The other 297 rely on one fixed, deterministic key (`asset_id` itself) proven sa
 
 - `mock_server.py` was planned, never built - the remaining discovery (as-0002, as-0012) happened live against real assets instead of rehearsed, mitigated by being small, controlled, single-asset tests.
 - No unit tests for `reconcile.py`'s state machine - confidence comes from those two experiments matching the model, not from exercising it directly.
+- important variables such as `MY_KEY` are in CONSTANTS.py which is a relly bad practice for production but since its a local take home assessment that is only 2 hours I simplified that.
