@@ -81,13 +81,18 @@ def run(conn: sqlite3.Connection, client: ApiClient) -> None:
         # instead of sitting in "ready" limbo for the rest of the run.
         for asset_id in journal.blocked_on_dead_parent(conn):
             row = journal.get_row(conn, asset_id)
-            parent = journal.get_row(conn, row.depends_on) if row and row.depends_on else None
+            if row is None or row.depends_on is None:
+                continue  # blocked_on_dead_parent only returns rows with a live parent id
+            parent = journal.get_row(conn, row.depends_on)
             reason = f"parent {row.depends_on} did not deploy (status={parent.status if parent else '?'})"
             journal.mark_parent_blocked(conn, asset_id, reason)
 
         ready = journal.ready_to_attempt(conn)
         if remaining <= C.STOP_NEW_WRITES_MINUTES:
-            ready = [aid for aid in ready if journal.get_row(conn, aid).attempts > 0]
+            ready = [
+                aid for aid in ready
+                if (r := journal.get_row(conn, aid)) is not None and r.attempts > 0
+            ]
             if not ready:
                 print(f"Only new-write candidates left and {remaining} min remaining - stopping.")
                 return
