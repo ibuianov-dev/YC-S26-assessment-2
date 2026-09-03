@@ -43,3 +43,25 @@ Splitting this into a few files so each one only does one job:
 - `report.py` - builds the report from the journal, but re-checks everything one more time with a fresh read right before it does. Only "confirmed" or "duplicate" can turn into "deployed" in the output - everything else is "blocked," even the stuff that's probably fine, because probably isn't the bar here. Actually sending it is a separate, on-purpose step - can't happen by accident.
 
 - `mock_server.py` - fake flaky version of the real thing, just to practice on before the clock starts. Randomly hangs, sometimes lies with an error after it already saved something, sometimes says "not found" for a second on something that's really there. Whole point is getting used to that before it's real and burning my two hours.
+
+## Findings after investigating api
+
+- Auth is two steps, not the one header the brief implied. POST /auth/start with just X-Candidate-Key gets back an access_token, expires_in (300s, confirmed twice), and run_minutes_remaining - that field only shows up here, not on other endpoints, and it's real, saw it count down from 120 to 108. Every other request needs BOTH X-Candidate-Key and Authorization: Bearer <token> together, confirmed by testing with only one - it fails. Token dies in 5 min, has to refresh way more than once
+
+- Catalog is GET /s2/assets, paginated 25 at a time - send back whatever next_cursor gave you as ?cursor=N, stop when next_cursor is null. Each item: id, kind, title, checksum, approved_at, depends_on
+
+- checksum still unexplained - just gets echoed back on a successful write, no idea if it's actually validated for anything.
+
+- Catalog list is static, doesn't reflect what's deployed. Checked as-0001's record again after deploying it identical to before, no flag, nothing. Don't bother re-checking this route for status.
+
+- Write endpoint is POST /s2/deploy, NOT /s2/assets - that 404s no matter what verb or shape I tried. Body needs the field called asset_id, not id (found out from a 400 error naming it exactly). Success is 201 with asset_id, checksum, and a timestamp called "at" in epoch ms.
+
+- Plain resend with no special header - correctly 409s as duplicate_write_refused. So a blind retry with nothing extra is already safe by default for the case where you actually got the original response.
+
+- The hint on that 409 points to a header, X-CQ-Idempotency-Key, "to make retries safe." Tested it - and typed it wrong on purpose by accident (as-001 instead of as-0001). Got a fresh 201 back instead of a 409, new timestamp, same asset_id. That means dedup is scoped to the exact key value, not to asset_id - a new/mistyped key = treated as a brand new write, even for something already deployed. Pretty sure this created a real second copy of as-0001.
+
+- No way to confirm the actual count - there's no read-verify endpoint at all. Tried GET /s2/assets/{id}, GET /s2/deploy/{id}, GET /s2/deploy?asset_id={id} - all 404 regardless of real state. Verification has to happen through the write endpoint's own response (409/201/timeout), there's nothing else to check against.
+
+- Rule this sets for the other 299: idempotency key has to be one fixed, deterministic value per asset (just use the asset_id itself), generated once, same every single retry - never regenerated, never hand-typed per-attempt. That's the only thing that actually makes a retry safe here.
+
+- as-0001 goes in the final report as an honest open question, not a clean "deployed" - possibly duplicated, caused by my own typo during discovery, can't confirm the real count either way since there's no read endpoint. This is going in NOTES.md's self-critique section as the concrete example, not smoothed over.
